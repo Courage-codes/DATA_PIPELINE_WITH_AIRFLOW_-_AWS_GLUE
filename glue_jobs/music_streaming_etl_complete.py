@@ -536,3 +536,263 @@ class MusicStreamingETL:
         except Exception as e:
             logger.error(f"Archiving task failed: {str(e)}")
             raise
+    
+    def save_to_s3_parquet(self, df):
+        """Save processed data to S3 as Parquet"""
+        try:
+            output_path = f"s3://{PROCESSED_BUCKET}/processed_data/date={PROCESSING_DATE}/batch_id={BATCH_ID}/"
+            df_with_metadata = df.withColumn("processing_timestamp", current_timestamp())\
+                                .withColumn("batch_id", lit(BATCH_ID))\
+                                .withColumn("processing_date", lit(PROCESSING_DATE))
+            record_count = df_with_metadata.count()
+            if record_count > MAX_RECORDS_PER_PARTITION:
+                num_partitions = max(1, record_count // MAX_RECORDS_PER_PARTITION)
+                df_with_metadata = df_with_metadata.repartition(num_partitions, "genre")
+            df_with_metadata.write\
+                .mode("append")\
+                .partitionBy("genre")\
+                .option("compression", "snappy")\
+                .option("maxRecordsPerFile", str(MAX_RECORDS_PER_PARTITION))\
+                .parquet(output_path)
+            logger.info(f"Saved {record_count} records to {output_path}")
+            self.publish_metric('RecordsSavedToS3', record_count)
+        except Exception as e:
+            logger.error(f"Failed to save to S3: {str(e)}")
+            self.publish_metric('S3SaveFailures', 1)
+            raise
+
+    def run_etl(self):
+        """Main ETL execution"""
+        processed_files = []
+        merged_df = None
+        dataframes = {}
+        try:
+            logger.info(f"Starting ETL for batch {BATCH_ID}")
+            self.create_dynamodb_table_if_not_exists()
+            self.create_file_tracking_table()
+            unprocessed_streams = self.get_unprocessed_files('streams')
+            unprocessed_songs = self.get_unprocessed_files('songs')
+            unprocessed_users = self.get_unprocessed_files('users')
+            if not unprocessed_streams and not unprocessed_songs and not unprocessed_users:
+                logger.info("No new files to process")
+                return []
+            if unprocessed_streams:
+                logger.info(f"Processing {len(unprocessed_streams)} streaming files")
+                for file_key in unprocessed_streams:
+                    self.mark_file_processing_start(file_key)
+                try:
+                    stream_paths = [f"s3://{RAW_DATA_BUCKET}/{file_key}" for file_key in unprocessed_streams]
+                    streaming_df = self.read_csv_with_schema_validation(
+                        stream_paths, 
+                        expected_schema=['user_id', 'track_id', 'timestamp']
+                    )
+                    if streaming_df is None:
+                        raise ValueError("Failed to read streaming data")
+                    streaming_df = streaming_df\
+                        .withColumnRenamed('listen_time', 'timestamp')\
+                        .withColumn('listen_duration', lit(180000))
+                    streaming_df = streaming_df.filter(
+                        col('timestamp').cast('date') == PROCESSING_DATE
+                    )
+                    stream_count = streaming_df.count()
+                    if stream_count > 0 and stream_count < MAX_RECORDS_PER_PARTITION:
+                        streaming_df.cache()
+                    dataframes['streams'] = streaming_df
+                    for file_key in unprocessed_streams:
+                        self.mark_file_completed(file_key, stream_count // len(unprocessed_streams))
+                        processed_files.append(file_key)
+                except Exception as e:
+                    for file_key in unprocessed_streams:
+                        self.mark_file_failed(file_key, str(e))
+                    raise
+            if unprocessed_songs:
+                logger.info(f"Processing {len(unprocessed_songs)} song files")
+                for file_key in unprocessed_songs:
+                    self.mark_file_processing_start(file_key)
+                try:
+                    songs_paths = [f"s3://{RAW_DATA_BUCKET}/{file_key}" for file_key in unprocessed_songs]
+                    songs_df = self.read_csv_with_schema_validation(
+                        songs_paths,
+                        expected_schema=['track_id', 'track_genre', 'track_name', 'artists', 'duration_ms', 'popularity']
+                    )
+                    if songs_df is None:
+                        raise ValueError("Failed to read songs data")
+                    songs_df = songs_df\
+                        .withColumnRenamed('track_genre', 'genre')\
+                        .withColumnRenamed('track_name', 'song_name')\
+                        .select('track_id', 'genre', 'song_name', 'artists', 'duration_ms', 'popularity')\
+                        .filter(col('track_id').isNotNull() & col('genre').isNotNull())
+                    songs_df = songs_df.dropDuplicates(['track_id'])
+                    dataframes['songs'] = songs_df
+                    songs_count = songs_df.count()
+                    for file_key in unprocessed_songs:
+                        self.mark_file_completed(file_key, songs_count // len(unprocessed_songs))
+                        processed_files.append(file_key)
+                except Exception as e:
+                    for file_key in unprocessed_songs:
+                        self.mark_file_failed(file_key, str(e))
+                    raise
+            if unprocessed_users:
+                logger.info(f"Processing {len(unprocessed_users)} user files")
+                for file_key in unprocessed_users:
+                    self.mark_file_processing_start(file_key)
+                try:
+                    users_paths = [f"s3://{RAW_DATA_BUCKET}/{file_key}" for file_key in unprocessed_users]
+                    users_df = self.read_csv_with_schema_validation(
+                        users_paths,
+                        expected_schema=['user_id', 'user_name', 'user_age', 'user_country']
+                    )
+                    if users_df is None:
+                        raise ValueError("Failed to read users data")
+                    users_df = users_df.select('user_id', 'user_name', 'user_age', 'user_country')\
+                                      .filter(col('user_id').isNotNull())\
+                                      .dropDuplicates(['user_id'])
+                    dataframes['users'] = users_df
+                    users_count = users_df.count()
+                    for file_key in unprocessed_users:
+                        self.mark_file_completed(file_key, users_count // len(unprocessed_users))
+                        processed_files.append(file_key)
+                except Exception as e:
+                    for file_key in unprocessed_users:
+                        self.mark_file_failed(file_key, str(e))
+                    raise
+            if 'streams' not in dataframes:
+                logger.warning("No streaming data to process")
+                return []
+            streaming_df = dataframes['streams']
+            if streaming_df.count() == 0:
+                logger.warning("Empty streaming DataFrame")
+                return []
+            merged_df = streaming_df
+            if 'songs' in dataframes and dataframes['songs'].count() > 0:
+                logger.info("Joining with songs data")
+                merged_df = merged_df.join(
+                    broadcast(dataframes['songs']), 
+                    on='track_id', 
+                    how='inner'
+                )
+                after_join_count = merged_df.count()
+                if after_join_count == 0:
+                    logger.error("No records after songs join")
+                    raise ValueError("Join with songs data resulted in empty DataFrame")
+                logger.info(f"Records after songs join: {after_join_count}")
+            if 'users' in dataframes and dataframes['users'].count() > 0:
+                logger.info("Joining with users data")
+                merged_df = merged_df.join(
+                    broadcast(dataframes['users']), 
+                    on='user_id', 
+                    how='left'
+                )
+                after_join_count = merged_df.count()
+                logger.info(f"Records after users join: {after_join_count}")
+            merged_df.cache()
+            self.processed_records = merged_df.count()
+            logger.info(f"Processing {self.processed_records} records after joins")
+            if self.processed_records > 0:
+                logger.info("Processing KPIs and writing to DynamoDB")
+                try:
+                    success = self.process_and_write_to_dynamodb(merged_df)
+                    if success:
+                        logger.info("DynamoDB processing completed")
+                    else:
+                        logger.warning("DynamoDB processing failed, continuing with S3 save")
+                except Exception as e:
+                    logger.error(f"DynamoDB processing failed: {str(e)}")
+                    self.publish_metric('DynamoDBProcessingFailures', 1)
+                logger.info("Saving processed data to S3")
+                try:
+                    self.save_to_s3_parquet(merged_df)
+                    logger.info("S3 save completed")
+                except Exception as e:
+                    logger.error(f"S3 save failed: {str(e)}")
+                    self.publish_metric('S3SaveFailures', 1)
+                self.publish_metric('ProcessedRecords', self.processed_records)
+                self.publish_metric('ProcessedBatches', 1)
+                self.publish_metric('ProcessedFiles', len(processed_files))
+                logger.info(f"ETL completed. Processed {self.processed_records} records from {len(processed_files)} files")
+                return processed_files
+            else:
+                logger.warning("No records to process after joins")
+                return []
+        except Exception as e:
+            logger.error(f"ETL job failed: {str(e)}")
+            logger.error(f"Traceback: {traceback.format_exc()}")
+            for file_key in processed_files:
+                self.mark_file_failed(file_key, str(e))
+            self.publish_metric('FailedBatches', 1)
+            self.publish_metric('FailedFiles', len(processed_files))
+            raise
+        finally:
+            try:
+                if merged_df is not None and hasattr(merged_df, 'unpersist'):
+                    merged_df.unpersist()
+                    logger.info("Unpersisted merged DataFrame")
+                for df_name, df in dataframes.items():
+                    if hasattr(df, 'unpersist'):
+                        df.unpersist()
+                        logger.info(f"Unpersisted {df_name} DataFrame")
+                spark.catalog.clearCache()
+            except Exception as e:
+                logger.warning(f"Error during cleanup: {str(e)}")
+
+def main():
+    """Main entry point with task-based execution"""
+    etl = None
+    try:
+        with spark_resource_manager():
+            etl = MusicStreamingETL()
+            if TASK_TYPE == 'full_etl':
+                logger.info("Running full ETL")
+                processed_files = etl.run_etl()
+                logger.info("Full ETL completed")
+            elif TASK_TYPE == 'dynamodb_only':
+                logger.info("Starting DynamoDB-only processing")
+                input_path = f"s3://{PROCESSED_BUCKET}/processed_data/date={PROCESSING_DATE}/batch_id={BATCH_ID}/"
+                try:
+                    merged_df = spark.read.parquet(input_path)
+                    success = etl.process_and_write_to_dynamodb(merged_df)
+                    if success:
+                        logger.info("DynamoDB processing completed")
+                    else:
+                        raise Exception("DynamoDB processing failed")
+                except Exception as e:
+                    logger.error(f"Error reading processed data for DynamoDB: {str(e)}")
+                    raise
+            elif TASK_TYPE == 'archiving_only':
+                logger.info("Starting archiving-only processing")
+                tracking_table_name = f"{DYNAMODB_TABLE_NAME}_file_tracker"
+                tracking_table = dynamodb.Table(tracking_table_name)
+                try:
+                    response = tracking_table.scan(
+                        FilterExpression='batch_id = :batch_id AND #status = :status',
+                        ExpressionAttributeNames={'#status': 'status'},
+                        ExpressionAttributeValues={
+                            ':batch_id': BATCH_ID,
+                            ':status': 'completed'
+                        }
+                    )
+                    processed_files = [item['file_key'] for item in response['Items']]
+                    etl.archive_files_task(processed_files)
+                except Exception as e:
+                    logger.error(f"Error in archiving task: {str(e)}")
+                    raise
+            else:
+                raise ValueError(f"Unknown task type: {TASK_TYPE}")
+        logger.info(f"Task '{TASK_TYPE}' completed")
+        job.commit()
+    except Exception as e:
+        logger.error(f"Task '{TASK_TYPE}' failed: {str(e)}")
+        logger.error(f"Full traceback: {traceback.format_exc()}")
+        if etl:
+            etl.publish_metric('JobFailures', 1)
+        raise
+    finally:
+        try:
+            if 'sc' in globals() and sc:
+                sc.stop()
+                logger.info("Spark context stopped")
+        except Exception as e:
+            logger.warning(f"Error stopping Spark context: {str(e)}")
+
+if __name__ == '__main__':
+    main()
