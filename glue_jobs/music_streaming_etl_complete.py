@@ -306,3 +306,142 @@ class MusicStreamingETL:
             logger.error(f"Marked file as failed: {file_key} - {error_message}")
         except Exception as e:
             logger.error(f"Error marking file as failed {file_key}: {e}")
+
+    def archive_processed_files(self, processed_files):
+        """Archive successfully processed files"""
+        archived_count = 0
+        failed_archives = 0
+        for file_key in processed_files:
+            try:
+                archive_key = f"archive/{datetime.now().strftime('%Y/%m/%d')}/{file_key}"
+                copy_source = {'Bucket': RAW_DATA_BUCKET, 'Key': file_key}
+                s3_client.copy_object(
+                    CopySource=copy_source,
+                    Bucket=ARCHIVE_BUCKET,
+                    Key=archive_key
+                )
+                s3_client.delete_object(Bucket=RAW_DATA_BUCKET, Key=file_key)
+                self.archived_files.append(archive_key)
+                archived_count += 1
+                logger.info(f"Archived file: {file_key} -> {archive_key}")
+            except Exception as e:
+                logger.error(f"Failed to archive file {file_key}: {str(e)}")
+                failed_archives += 1
+        logger.info(f"Archived {archived_count} files, {failed_archives} failures")
+        self.publish_metric('ArchivedFiles', archived_count)
+        self.publish_metric('ArchiveFailures', failed_archives)
+
+    def read_csv_with_schema_validation(self, file_paths, expected_schema=None):
+        """Read CSV files with schema validation"""
+        try:
+            df = spark.read\
+                .option("header", "true")\
+                .option("inferSchema", "true")\
+                .option("multiline", "true")\
+                .option("escape", "\"")\
+                .csv(file_paths)
+            if expected_schema and df.columns != expected_schema:
+                logger.warning(f"Schema mismatch. Expected: {expected_schema}, Got: {df.columns}")
+            if df.count() == 0:
+                logger.warning("Empty DataFrame after reading CSV files")
+                return None
+            return df
+        except Exception as e:
+            logger.error(f"Error reading CSV files: {str(e)}")
+            raise
+
+    def compute_daily_kpis(self, merged_df):
+        """Compute daily KPIs"""
+        try:
+            if merged_df.count() == 0:
+                logger.warning("Empty DataFrame for KPI computation")
+                return {}
+            kpis = {}
+            genre_kpis = merged_df.filter(col('genre').isNotNull())\
+                                 .groupBy('genre')\
+                                 .agg(
+                                     count('*').alias('listen_count'),
+                                     countDistinct('user_id').alias('unique_listeners'),
+                                     spark_sum('listen_duration').alias('total_listening_time'),
+                                     avg('listen_duration').alias('avg_listening_time_per_user')
+                                 )\
+                                 .filter(col('listen_count') > 0)
+            kpis['genre_metrics'] = genre_kpis
+            window_spec = Window.partitionBy('genre').orderBy(desc('play_count'))
+            song_plays = merged_df.filter(col('genre').isNotNull() & col('track_id').isNotNull())\
+                                 .groupBy('genre', 'track_id', 'song_name')\
+                                 .agg(count('*').alias('play_count'))\
+                                 .filter(col('play_count') > 0)
+            if song_plays.count() > 0:
+                top_songs = song_plays.withColumn('rank', row_number().over(window_spec))\
+                                     .filter(col('rank') <= 3)
+                kpis['top_songs_per_genre'] = top_songs
+            if 'genre_metrics' in kpis and genre_kpis.count() > 0:
+                top_genres = genre_kpis.orderBy(desc('listen_count')).limit(5)
+                kpis['top_genres'] = top_genres
+            logger.info("Computed daily KPIs successfully")
+            return kpis
+        except Exception as e:
+            logger.error(f"Error computing KPIs: {str(e)}")
+            raise
+
+    def prepare_dynamodb_items(self, kpis):
+        """Prepare items for DynamoDB insertion"""
+        items = []
+        try:
+            if 'genre_metrics' in kpis:
+                for row in kpis['genre_metrics'].collect():
+                    base_partition_key = self.generate_partition_key(row['genre'], PROCESSING_DATE)
+                    metrics = [
+                        ('listen_count', row['listen_count']),
+                        ('unique_listeners', row['unique_listeners']),
+                        ('total_listening_time', row['total_listening_time']),
+                        ('avg_listening_time_per_user', row['avg_listening_time_per_user'])
+                    ]
+                    for metric_type, value in metrics:
+                        if value is not None:
+                            items.append({
+                                'partition_key': base_partition_key,
+                                'sort_key': f"{metric_type}#{PROCESSING_DATE}",
+                                'genre': row['genre'],
+                                'date': PROCESSING_DATE,
+                                'metric_type': metric_type,
+                                'value': self.convert_for_dynamodb(value),
+                                'batch_id': BATCH_ID,
+                                'created_at': datetime.now().isoformat()
+                            })
+            if 'top_songs_per_genre' in kpis:
+                for row in kpis['top_songs_per_genre'].collect():
+                    partition_key = self.generate_partition_key(row['genre'], PROCESSING_DATE)
+                    items.append({
+                        'partition_key': partition_key,
+                        'sort_key': f"top_song#{row['rank']}#{row['track_id']}",
+                        'genre': row['genre'],
+                        'date': PROCESSING_DATE,
+                        'metric_type': 'top_song',
+                        'track_id': row['track_id'],
+                        'song_name': row['song_name'],
+                        'play_count': self.convert_for_dynamodb(row['play_count']),
+                        'rank': row['rank'],
+                        'batch_id': BATCH_ID,
+                        'created_at': datetime.now().isoformat()
+                    })
+            if 'top_genres' in kpis:
+                for idx, row in enumerate(kpis['top_genres'].collect(), 1):
+                    partition_key = f"daily_top_genres#{PROCESSING_DATE}"
+                    items.append({
+                        'partition_key': partition_key,
+                        'sort_key': f"rank#{str(idx).zfill(2)}#{row['genre']}",
+                        'date': PROCESSING_DATE,
+                        'metric_type': 'top_genre',
+                        'genre': row['genre'],
+                        'listen_count': self.convert_for_dynamodb(row['listen_count']),
+                        'rank': idx,
+                        'batch_id': BATCH_ID,
+                        'created_at': datetime.now().isoformat()
+                    })
+            logger.info(f"Prepared {len(items)} items for DynamoDB")
+            return items
+        except Exception as e:
+            logger.error(f"Error preparing DynamoDB items: {str(e)}")
+            raise
