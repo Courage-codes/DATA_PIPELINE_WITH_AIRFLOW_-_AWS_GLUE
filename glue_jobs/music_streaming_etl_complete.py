@@ -188,3 +188,121 @@ class MusicStreamingETL:
                 return table
             else:
                 raise
+    def create_file_tracking_table(self):
+        """Create DynamoDB table for file tracking"""
+        tracking_table_name = f"{DYNAMODB_TABLE_NAME}_file_tracker"
+        try:
+            table = dynamodb.Table(tracking_table_name)
+            table.load()
+            logger.info(f"File tracking table {tracking_table_name} exists")
+            return table
+        except ClientError as e:
+            if e.response['Error']['Code'] == 'ResourceNotFoundException':
+                logger.info(f"Creating file tracking table {tracking_table_name}")
+                table = dynamodb.create_table(
+                    TableName=tracking_table_name,
+                    KeySchema=[
+                        {'AttributeName': 'file_key', 'KeyType': 'HASH'}
+                    ],
+                    AttributeDefinitions=[
+                        {'AttributeName': 'file_key', 'AttributeType': 'S'}
+                    ],
+                    BillingMode='PAY_PER_REQUEST'
+                )
+                table.wait_until_exists()
+                logger.info(f"File tracking table {tracking_table_name} created")
+                return table
+            else:
+                raise
+
+    def get_unprocessed_files(self, dataset_type):
+        """Get list of unprocessed files for a dataset type"""
+        tracking_table_name = f"{DYNAMODB_TABLE_NAME}_file_tracker"
+        tracking_table = dynamodb.Table(tracking_table_name)
+        try:
+            response = s3_client.list_objects_v2(
+                Bucket=RAW_DATA_BUCKET,
+                Prefix=f"{dataset_type}/"
+            )
+            all_files = []
+            if 'Contents' in response:
+                all_files = [obj['Key'] for obj in response['Contents'] 
+                           if obj['Key'].endswith('.csv') and obj['Size'] > 0]
+            unprocessed_files = []
+            for file_key in all_files:
+                try:
+                    response = tracking_table.get_item(
+                        Key={'file_key': file_key}
+                    )
+                    if 'Item' not in response:
+                        unprocessed_files.append(file_key)
+                    else:
+                        status = response['Item'].get('status', 'unknown')
+                        if status == 'failed':
+                            unprocessed_files.append(file_key)
+                            logger.info(f"Retrying failed file: {file_key}")
+                        else:
+                            logger.info(f"Skipping processed file: {file_key}")
+                except Exception as e:
+                    logger.error(f"Error checking file status for {file_key}: {e}")
+                    unprocessed_files.append(file_key)
+            logger.info(f"Found {len(unprocessed_files)} unprocessed {dataset_type} files")
+            return unprocessed_files
+        except Exception as e:
+            logger.error(f"Error listing files for {dataset_type}: {e}")
+            return []
+
+    def mark_file_processing_start(self, file_key):
+        """Mark file as being processed"""
+        tracking_table_name = f"{DYNAMODB_TABLE_NAME}_file_tracker"
+        tracking_table = dynamodb.Table(tracking_table_name)
+        try:
+            tracking_table.put_item(
+                Item={
+                    'file_key': file_key,
+                    'status': 'processing',
+                    'started_at': datetime.now().isoformat(),
+                    'batch_id': BATCH_ID
+                }
+            )
+            logger.info(f"Marked file as processing: {file_key}")
+        except Exception as e:
+            logger.error(f"Error marking file as processing {file_key}: {e}")
+
+    def mark_file_completed(self, file_key, record_count):
+        """Mark file as successfully processed"""
+        tracking_table_name = f"{DYNAMODB_TABLE_NAME}_file_tracker"
+        tracking_table = dynamodb.Table(tracking_table_name)
+        try:
+            tracking_table.update_item(
+                Key={'file_key': file_key},
+                UpdateExpression='SET #status = :status, completed_at = :timestamp, record_count = :count',
+                ExpressionAttributeNames={'#status': 'status'},
+                ExpressionAttributeValues={
+                    ':status': 'completed',
+                    ':timestamp': datetime.now().isoformat(),
+                    ':count': record_count
+                }
+            )
+            logger.info(f"Marked file as completed: {file_key} with {record_count} records")
+        except Exception as e:
+            logger.error(f"Error marking file as completed {file_key}: {e}")
+
+    def mark_file_failed(self, file_key, error_message):
+        """Mark file as failed"""
+        tracking_table_name = f"{DYNAMODB_TABLE_NAME}_file_tracker"
+        tracking_table = dynamodb.Table(tracking_table_name)
+        try:
+            tracking_table.update_item(
+                Key={'file_key': file_key},
+                UpdateExpression='SET #status = :status, failed_at = :timestamp, error_message = :error',
+                ExpressionAttributeNames={'#status': 'status'},
+                ExpressionAttributeValues={
+                    ':status': 'failed',
+                    ':timestamp': datetime.now().isoformat(),
+                    ':error': str(error_message)[:1000]
+                }
+            )
+            logger.error(f"Marked file as failed: {file_key} - {error_message}")
+        except Exception as e:
+            logger.error(f"Error marking file as failed {file_key}: {e}")
