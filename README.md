@@ -5,7 +5,7 @@
 This document describes a real-time music streaming data pipeline that validates, processes and  computes key performance indicators (KPIs), and archives processed files. The pipeline is triggered automatically by an AWS Lambda function when new files are uploaded to an S3 bucket. It consists of two AWS Glue jobs (`music_streaming_validation` and `music_streaming_etl_complete`), orchestrated by an Apache Airflow DAG (`music_streaming_realtime_pipeline`), and initiated by a Lambda function (`trigger_dag_lambda`). The system ensures data quality through validation, processes data using Spark, stores results in S3 and DynamoDB, and archives processed files.
 
 ## Architecture
-![Architecture Diagram](./images/Airflow_architecture.png)
+![Architecture Diagram](./images/architecture_diagram.svg)
 
 The pipeline follows a modular architecture with four main components:
 
