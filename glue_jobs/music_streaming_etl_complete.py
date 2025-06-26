@@ -445,3 +445,94 @@ class MusicStreamingETL:
         except Exception as e:
             logger.error(f"Error preparing DynamoDB items: {str(e)}")
             raise
+    
+    def write_to_dynamodb_batch(self, items):
+        """Write items to DynamoDB using batch operations"""
+        if not items:
+            logger.info("No items to write to DynamoDB")
+            return
+        table = dynamodb.Table(DYNAMODB_TABLE_NAME)
+        successful_writes = 0
+        failed_writes = 0
+        try:
+            batch_size = 25
+            with table.batch_writer() as batch:
+                for i in range(0, len(items), batch_size):
+                    batch_items = items[i:i + batch_size]
+                    for item in batch_items:
+                        try:
+                            converted_item = {k: self.convert_for_dynamodb(v) 
+                                            for k, v in item.items() if v is not None}
+                            batch.put_item(Item=converted_item)
+                            successful_writes += 1
+                        except Exception as e:
+                            logger.error(f"Failed to write batch item: {str(e)}")
+                            failed_writes += 1
+                    if i % (batch_size * 10) == 0:
+                        logger.info(f"Processed {i + len(batch_items)} / {len(items)} items")
+        except Exception as e:
+            logger.error(f"Batch write operation failed: {str(e)}")
+            failed_writes += len(items) - successful_writes
+        logger.info(f"DynamoDB writes - Successful: {successful_writes}, Failed: {failed_writes}")
+        self.publish_metric('DynamoDBWrites', successful_writes)
+        self.publish_metric('DynamoDBWriteFailures', failed_writes)
+
+    def process_and_write_to_dynamodb(self, merged_df):
+        """Process KPIs and write to DynamoDB"""
+        try:
+            logger.info("Starting DynamoDB processing task")
+            if merged_df is None:
+                logger.error("merged_df is None")
+                return False
+            record_count = merged_df.count()
+            logger.info(f"DynamoDB processing: {record_count} records")
+            if record_count == 0:
+                logger.warning("No records for DynamoDB processing")
+                return False
+            logger.info("DataFrame schema:")
+            merged_df.printSchema()
+            logger.info("Sample data (first 3 rows):")
+            merged_df.show(3, truncate=False)
+            logger.info("Computing KPIs...")
+            kpis = self.compute_daily_kpis(merged_df)
+            if kpis:
+                logger.info("KPI Computation Results:")
+                for kpi_name, kpi_df in kpis.items():
+                    if hasattr(kpi_df, 'count'):
+                        kpi_count = kpi_df.count()
+                        logger.info(f"KPI {kpi_name}: {kpi_count} records")
+                        if kpi_count > 0:
+                            logger.info(f"Sample {kpi_name} data:")
+                            kpi_df.show(3, truncate=False)
+                logger.info("Preparing DynamoDB items...")
+                dynamodb_items = self.prepare_dynamodb_items(kpis)
+                if dynamodb_items:
+                    logger.info(f"Writing {len(dynamodb_items)} items to DynamoDB")
+                    logger.info("Sample DynamoDB items:")
+                    for i, item in enumerate(dynamodb_items[:3]):
+                        logger.info(f"Item {i+1}: {json.dumps(item, indent=2, default=str)}")
+                    self.write_to_dynamodb_batch(dynamodb_items)
+                    logger.info("DynamoDB processing completed")
+                    return True
+                else:
+                    logger.warning("No DynamoDB items prepared")
+                    return False
+            else:
+                logger.warning("No KPIs computed")
+                return False
+        except Exception as e:
+            logger.error(f"DynamoDB processing failed: {str(e)}")
+            logger.error(f"Traceback: {traceback.format_exc()}")
+            return False
+
+    def archive_files_task(self, processed_files_list):
+        """Archive files as a separate task"""
+        try:
+            if processed_files_list:
+                self.archive_processed_files(processed_files_list)
+                logger.info(f"Archived {len(processed_files_list)} files")
+            else:
+                logger.info("No files to archive")
+        except Exception as e:
+            logger.error(f"Archiving task failed: {str(e)}")
+            raise
