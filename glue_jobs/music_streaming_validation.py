@@ -96,7 +96,7 @@ class MusicStreamingDataValidator:
         }
         try:
             obj = s3_client.get_object(Bucket=RAW_DATA_BUCKET, Key=file_key)
-            df = pd.read_csv(io.BytesIO(obj['Body'].read()))
+            df = pd.read_csv(io.BytesIO(obj['Body'].read()), usecols=[0])
             res['file_readable'] = True
             required = set(self.required_columns[dataset_type])
             missing = required - set(df.columns)
